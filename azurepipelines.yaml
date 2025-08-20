@@ -1,0 +1,247 @@
+# Maven Build and Multi-Stage Deployment Pipeline
+# This pipeline builds a Java Spring Boot application and deploys it sequentially
+# to Development, QA, and Production Azure App Services (Windows).
+# It includes automated testing and SonarQube analysis in the QA stage.
+
+trigger:
+- master # This pipeline will run automatically on every push to the master branch
+
+pool:
+  vmImage: 'windows-latest' # Using a Microsoft-hosted Windows agent for all stages for Windows App Service deployments
+
+# --- Runtime Parameters ---
+# These parameters allow you to control pipeline behavior when you queue a run.
+parameters:
+- name: deployDev
+  displayName: Deploy to Development Environment?
+  type: boolean
+  default: true # Set to 'true' by default to deploy to Dev. Uncheck this in the UI to skip Dev deployment.
+
+stages:
+- stage: Build
+  displayName: 'Build Application and Create Artifact'
+  jobs:
+  - job: BuildJob
+    displayName: 'Compile, Package, and Test'
+    steps:
+    - checkout: self # Clones the repository to the agent's working directory
+
+    - task: Maven@4 # Azure DevOps built-in task for Maven builds
+      displayName: 'Maven Build and Unit Tests'
+      inputs:
+        mavenPomFile: 'pom.xml' # Path to your Maven Project Object Model file (assumed at repository root)
+        goals: 'clean install' # Maven goals: 'clean' for cleanup, 'install' to compile, test, and package
+        publishJUnitResults: true # Publishes JUnit test results found by Maven
+        testResultsFiles: '**/surefire-reports/TEST-*.xml' # Pattern for Maven Surefire unit test reports
+        testRunTitle: 'Unit Tests - $(Build.BuildNumber)' # Title for the test run in Azure DevOps
+        codeCoverageToolOption: 'JaCoCo' # Integrates JaCoCo for code coverage analysis
+        codeCoverageClassFilesDirectories: '$(System.DefaultWorkingDirectory)/target/classes' # Path to compiled classes
+        codeCoverageSourceDirectories: '$(System.DefaultWorkingDirectory)/src/main/java' # Path to source code for coverage
+        codeCoverageRestoreOriginalPomXml: true
+        javaHomeOption: 'JDKVersion' # Use a specific JDK version
+        jdkVersionOption: '17' # Specify JDK 17, matching your pom.xml
+        mavenVersionOption: 'Default' # Use the default Maven version available on the agent
+        mavenAuthenticateFeed: false
+        effectivePomSkip: false
+        sonarQubeRunAnalysis: false # Keep this false here; SonarQube analysis is configured in the QA stage
+
+    - task: PublishBuildArtifacts@1 # Task to publish the built application artifact
+      displayName: 'Publish WebApp Artifact'
+      inputs:
+        PathtoPublish: '$(System.DefaultWorkingDirectory)/target/demo-0.0.1-SNAPSHOT.jar' # Explicit path to the executable JAR file
+        ArtifactName: 'WebApp' # The name of the published artifact. This name is used to download it in subsequent stages.
+        publishLocation: 'Container' # Publish to Azure Pipelines' internal container storage
+
+--- # Separator for clarity between stages
+
+- stage: DeployToDev
+  displayName: 'Deploy to Development Environment'
+  dependsOn: Build # This stage will only run after the 'Build' stage completes successfully
+  # Condition to skip this stage based on the 'deployDev' runtime parameter
+  condition: eq('${{ parameters.deployDev }}', 'True')
+  jobs:
+  - deployment: DeployWebAppToDev # Unique name for this deployment job
+    displayName: 'Deploy to Dev App Service'
+    environment: 'Dev' # Links to the Azure DevOps Environment named 'Dev' for tracking and potential checks
+    pool:
+      vmImage: 'windows-latest' # Ensures a Windows agent for deployment to Windows App Service
+    strategy:
+      runOnce: # Simplest deployment strategy: runs steps once
+        deploy: # Lifecycle hook for actual deployment steps
+          steps:
+          # Download the artifact published by the Build stage
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download WebApp Artifact for Dev'
+            inputs:
+              buildType: 'current'
+              artifactName: 'WebApp'
+              targetPath: '$(Pipeline.Workspace)\WebApp' # Windows path for the agent's workspace
+
+          # Optional: Debugging script to list contents after artifact download
+          - script: |
+              echo "--- Listing contents of $(Pipeline.Workspace) after artifact download for Dev ---"
+              dir "$(Pipeline.Workspace)\WebApp"
+            displayName: 'Debug: List Workspace Contents for Dev'
+
+          # Optional: Debugging script to verify the JAR presence
+          - script: |
+              echo "--- Verifying WebApp JAR in download location for Dev ---"
+              dir "$(Pipeline.Workspace)\WebApp\demo-0.0.1-SNAPSHOT.jar"
+            displayName: 'Debug: Verify WebApp JAR for Dev'
+
+          # Deploy the Java App to Azure App Service for Development
+          - task: AzureRmWebAppDeployment@5
+            displayName: 'Deploy Java App to Dev'
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: 'YourDevAzureServiceConnection' # REPLACE: Name of your Service Connection for the Dev Azure Subscription
+              appType: 'webApp' # Target a Windows Web App
+              WebAppName: 'your-dev-app-service-name' # REPLACE: Your actual Azure App Service name for Development
+              package: '$(Pipeline.Workspace)\WebApp\demo-0.0.1-SNAPSHOT.jar' # Path to the downloaded JAR artifact on the agent
+              RuntimeStack: 'JAVA|17' # Specifies the Java 17 runtime for the App Service
+              StartupCommand: 'java -jar D:\home\site\wwwroot\demo-0.0.1-SNAPSHOT.jar' # Startup command for Spring Boot on Windows App Service
+
+--- # Separator for clarity between stages
+
+- stage: DeployToQA
+  displayName: 'Deploy to QA Environment'
+  # This stage depends directly on the 'Build' stage. This allows it to run even if 'DeployToDev' is skipped.
+  dependsOn: Build
+  jobs:
+  - deployment: DeployWebAppToQA # Unique name for this deployment job
+    displayName: 'Deploy to QA App Service & Run Tests'
+    environment: 'QA' # Links to the Azure DevOps Environment named 'QA' for tracking and critical approvals/checks
+    pool:
+      vmImage: 'windows-latest' # Ensures a Windows agent for deployment to Windows App Service
+    strategy:
+      runOnce: # Simplest deployment strategy: runs steps once
+        deploy: # Lifecycle hook for actual deployment and testing steps
+          steps:
+          # Download the artifact published by the Build stage
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download WebApp Artifact for QA'
+            inputs:
+              buildType: 'current'
+              artifactName: 'WebApp'
+              targetPath: '$(Pipeline.Workspace)\WebApp' # Windows path for the agent's workspace
+
+          # Optional: Debugging script to list contents after artifact download
+          - script: |
+              echo "--- Listing contents of $(Pipeline.Workspace) after artifact download for QA ---"
+              dir "$(Pipeline.Workspace)\WebApp"
+            displayName: 'Debug: List Workspace for QA'
+
+          # Deploy the Java App to Azure App Service for QA
+          - task: AzureRmWebAppDeployment@5
+            displayName: 'Deploy Java App to QA'
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: 'YourQAAzureServiceConnection' # REPLACE: Name of your Service Connection for the QA Azure Subscription
+              appType: 'webApp' # Target a Windows Web App
+              WebAppName: 'your-qa-app-service-name' # REPLACE: Your actual Azure App Service name for QA
+              package: '$(Pipeline.Workspace)\WebApp\demo-0.0.1-SNAPSHOT.jar' # Path to the downloaded JAR artifact on the agent
+              RuntimeStack: 'JAVA|17' # Specifies the Java 17 runtime for the App Service
+              StartupCommand: 'java -jar D:\home\site\wwwroot\demo-0.0.1-SNAPSHOT.jar' # Startup command for Spring Boot on Windows App Service
+
+          # --- Automated Testing in QA ---
+          # This section executes your automated test scripts against the newly deployed QA application.
+          # The specific script/task depends on your testing framework and how tests are structured in your repo.
+          - script: |
+              echo "--- Executing Automated Integration/E2E Tests against QA App ---"
+              # IMPORTANT: Replace this with the actual command to run your test suite.
+              # Your test scripts should be present in your repository, for example:
+              # cd $(System.DefaultWorkingDirectory)\qa-automation-tests
+              # npm test # Example if using Node.js/Cypress/Playwright tests
+              # python -m pytest # Example if using Python/Pytest
+              # mvn -f $(System.DefaultWorkingDirectory)\your-qa-test-project\pom.xml verify # Example if using Maven integration tests
+            displayName: 'Run Automated QA Tests'
+
+          # Publish Automated Test Results
+          # This task collects test reports and publishes them to Azure DevOps, making them visible in the 'Tests' tab.
+          - task: PublishTestResults@2
+            displayName: 'Publish QA Test Results'
+            inputs:
+              testResultsFormat: 'JUnit' # Format of your test results (e.g., JUnit XML is widely supported)
+              testResultsFiles: '**/surefire-reports/TEST-*.xml' # REPLACE: Path pattern to your test results XML files
+                                                               # (e.g., '**/target/surefire-reports/TEST-*.xml' for Maven)
+              mergeTestResults: true # Combines results from multiple files into a single report
+              failTaskOnFailedTests: true # CRUCIAL: Makes the stage fail if any tests fail (Quality Gate)
+
+          # --- SonarQube Code Analysis ---
+          # This section integrates static code analysis using SonarQube.
+          # Ensure your SonarQube server is running and a Service Connection exists in Azure DevOps.
+          - task: SonarQubePrepare@5
+            displayName: 'Prepare SonarQube Analysis'
+            inputs:
+              SonarQube: 'YourSonarQubeServiceConnection' # REPLACE: Name of your SonarQube Service Connection
+              scannerMode: 'CLI' # Or 'Maven' if your pom.xml is fully configured to handle Sonar analysis
+              projectKey: 'your-spring-boot-app-qa' # Unique identifier for this project in SonarQube for QA
+              projectName: 'Your Spring Boot App - QA' # Human-readable name for QA analysis in SonarQube
+              # Optional: Provide paths to sources, binaries, etc. if not detected automatically by SonarScanner
+              # extraProperties: |
+              #   sonar.sources=$(System.DefaultWorkingDirectory)\src\main\java
+              #   sonar.tests=$(System.DefaultWorkingDirectory)\src\test\java
+              #   sonar.java.binaries=$(System.DefaultWorkingDirectory)\target\classes
+              #   sonar.projectVersion=$(Build.BuildNumber)
+
+          # Execute SonarQube Code Analysis
+          # This task runs the actual SonarScanner.
+          - task: Maven@4
+            displayName: 'Run SonarQube Code Analysis'
+            inputs:
+              mavenPomFile: 'pom.xml' # Path to your project's pom.xml (assuming it's at the repo root)
+              goals: 'sonar:sonar' # Executes the SonarQube analysis goal
+              javaHomeOption: 'JDKVersion'
+              jdkVersionOption: '17'
+              mavenVersionOption: 'Default'
+
+          # Publish SonarQube Quality Gate Result
+          # This task waits for the SonarQube analysis to complete and checks its Quality Gate status.
+          # If the Quality Gate fails, this task will fail the pipeline stage.
+          - task: SonarQubePublish@5
+            displayName: 'Publish SonarQube Quality Gate Result'
+            inputs:
+              pollingTimeoutSec: '300' # How long to wait for the analysis to complete (in seconds)
+
+--- # Separator for clarity between stages
+
+- stage: DeployToProd
+  displayName: 'Deploy to Production Environment'
+  dependsOn: DeployToQA # This stage runs only after 'DeployToQA' completes successfully
+  # IMPORTANT: Configure stringent approvals and checks on the 'Production' environment
+  # in Azure DevOps (Pipelines -> Environments -> Production -> Approvals and checks)
+  jobs:
+  - deployment: DeployWebAppToProd # Unique name for this deployment job
+    displayName: 'Deploy to Production App Service'
+    environment: 'Production' # Links to the Azure DevOps Environment named 'Production' for strict approvals/checks
+    pool:
+      vmImage: 'windows-latest' # Ensures a Windows agent for deployment to Windows App Service
+    strategy:
+      runOnce: # Simplest deployment strategy: runs steps once
+        deploy: # Lifecycle hook for actual deployment steps
+          steps:
+          # Download the artifact (the exact same one that passed QA)
+          - task: DownloadPipelineArtifact@2
+            displayName: 'Download WebApp Artifact for Prod'
+            inputs:
+              buildType: 'current'
+              artifactName: 'WebApp'
+              targetPath: '$(Pipeline.Workspace)\WebApp' # Windows path for the agent's workspace
+
+          # Optional: Debugging script to list contents after artifact download
+          - script: |
+              echo "--- Listing contents of $(Pipeline.Workspace) after artifact download for Prod ---"
+              dir "$(Pipeline.Workspace)\WebApp"
+            displayName: 'Debug: List Workspace for Prod'
+
+          # Deploy the Java App to Azure App Service for Production
+          - task: AzureRmWebAppDeployment@5
+            displayName: 'Deploy Java App to Production'
+            inputs:
+              ConnectionType: 'AzureRM'
+              azureSubscription: 'YourProdAzureServiceConnection' # REPLACE: Name of your Service Connection for the Prod Azure Subscription
+              appType: 'webApp' # Target a Windows Web App
+              WebAppName: 'your-prod-app-service-name' # REPLACE: Your actual Azure App Service name for Production
+              package: '$(Pipeline.Workspace)\WebApp\demo-0.0.1-SNAPSHOT.jar' # Path to the downloaded JAR artifact on the agent
+              RuntimeStack: 'JAVA|17' # Specifies the Java 17 runtime for the App Service
+              StartupCommand: 'java -jar D:\home\site\wwwroot\demo-0.0.1-SNAPSHOT.jar' # Startup command for Spring Boot on Windows App Service
